@@ -1,10 +1,13 @@
+use std::collections::HashMap;
+use containerd_client::services::v1::leases_client::LeasesClient;
 use containerd_client::tonic::Request;
 use containerd_client::services::v1::streaming_client::StreamingClient;
 use containerd_client::services::v1::transfer_client::TransferClient;
-use containerd_client::services::v1::TransferRequest;
+use containerd_client::services::v1::{CreateRequest, TransferRequest};
 use containerd_client::types::Platform;
 use containerd_client::types::transfer::{ImageStore, OciRegistry, RegistryResolver, UnpackConfiguration};
 use containerd_client::with_namespace;
+use tonic::IntoStreamingRequest;
 use uuid::Uuid;
 
 const CONTAINERD_SOCK: &str = "/run/containerd/containerd.sock";
@@ -15,6 +18,23 @@ const NAMESPACE: &str = "default";
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
     let channel = containerd_client::connect(CONTAINERD_SOCK).await.unwrap();
+    let lease_name = Uuid::new_v4().to_string();
+
+    // https://github.com/containerd/containerd/blob/main/docs/garbage-collection.md#using-grpc
+    let mut lease_client = LeasesClient::new(channel.clone());
+    let lease_req = with_namespace!(CreateRequest {
+        id: lease_name.clone(),
+        labels: HashMap::new(),
+    }, NAMESPACE);
+    let lease = match lease_client.create(lease_req).await {
+        Ok(l) => { println!("lease OK"); l.into_inner() },
+        Err(e) => {
+            println!("lease create failed {:?}", e);
+            return;
+        }
+    };
+    let lease = lease.lease.unwrap();
+    println!("lease: {:?}", lease);
 
     let stream_uuid = Uuid::new_v4().to_string();
     let mut stream_client = StreamingClient::new(channel.clone());
@@ -22,8 +42,9 @@ async fn main() {
         id: stream_uuid.clone()
     };
     let req = containerd_client::to_any(&req);
-    // let req = with_namespace!(req, NAMESPACE);
-    let mut stream = match stream_client.stream(tokio_stream::iter([req])).await {
+    let mut req = tokio_stream::iter([req]).into_streaming_request();
+    req.metadata_mut().insert("containerd-lease", lease.id.clone().parse().unwrap());
+    let mut stream = match stream_client.stream(req).await {
         Ok(s) => s.into_inner(),
         Err(e) => {
             println!("stream init failed {:?}", e) ;
@@ -81,7 +102,9 @@ async fn main() {
     println!("sending pull request");
     let j = tokio::spawn(  async move{
         let mut client = TransferClient::new(channel.clone());
-        client.transfer(with_namespace!(request, NAMESPACE)).await
+        let mut req = with_namespace!(request, NAMESPACE);
+        req.metadata_mut().insert("containerd-lease", lease.id.clone().parse().unwrap());
+        client.transfer(req).await
     });
     // println!("checking stream 3!");
     // match stream.message().await {
